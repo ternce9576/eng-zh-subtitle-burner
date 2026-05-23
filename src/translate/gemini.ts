@@ -1,14 +1,11 @@
-import {
-	TRANSLATE_SYSTEM,
-	buildTranslatePrompt,
-	parseTranslateResponse,
-} from "./common.js";
+import type { ChatOptions } from "./common.js";
 
 export async function chatGemini(
 	systemMsg: string,
 	userMsg: string,
 	apiKey: string,
 	model: string,
+	opts: ChatOptions = {},
 ): Promise<string> {
 	const { GoogleGenerativeAI } = await import("@google/generative-ai");
 	const genAI = new GoogleGenerativeAI(apiKey);
@@ -16,28 +13,13 @@ export async function chatGemini(
 
 	const result = await genModel.generateContent({
 		systemInstruction: systemMsg,
-		contents: [
-			{
-				role: "user",
-				parts: [{ text: userMsg }],
-			},
-		],
-		generationConfig: { temperature: 0.3 },
+		contents: [{ role: "user", parts: [{ text: userMsg }] }],
+		generationConfig: {
+			temperature: opts.temperature ?? 0.5,
+			maxOutputTokens: opts.maxTokens ?? 8192,
+			...(opts.jsonMode ? { responseMimeType: "application/json" } : {}),
+		},
 	});
 
 	return result.response.text();
-}
-
-export async function translateBatchGemini(
-	texts: string[],
-	apiKey: string,
-	model: string,
-): Promise<string[]> {
-	const content = await chatGemini(
-		TRANSLATE_SYSTEM,
-		buildTranslatePrompt(texts),
-		apiKey,
-		model,
-	);
-	return parseTranslateResponse(content, texts.length);
 }

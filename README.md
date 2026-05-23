@@ -82,7 +82,7 @@ subtitle-burner <input> [options]
 | `--ollama-url <url>` | Ollama server URL (default: `http://ollama:11434`) |
 | `--batch-size <n>` | Translation batch size (default: 20) |
 | `--fix-transcription` | Use AI to fix misheard words in transcription before translating |
-| `--context <text>` | Additional context for AI (e.g. `"youtuber plays minecraft hypixel bedwars"`) |
+| `--context <text>` | Additional context for AI — passed to both transcription fix AND translation. Strongly recommended for any video with jargon, slang, or proper nouns (e.g. `"youtuber plays minecraft hypixel bedwars, casual gaming commentary"`) |
 
 ### Transcription options
 
@@ -127,3 +127,24 @@ subtitle-burner <input> [options]
 ./run.sh ./gameplay.mp4 --translate-via chatgpt --api-key sk-... \
   --fix-transcription --context "youtuber plays minecraft hypixel bedwars"
 ```
+
+## Getting the most natural Chinese
+
+The translator is prompted to keep English game/community jargon (GG, OP, clutch, AFK,
+Hypixel, Bedwars, etc.) verbatim and to use colloquial Chinese with appropriate particles
+(啊、吧、嘛、咯). For best results:
+
+- **Always use `--context`.** It is now passed to the translation step (not just
+  transcription fix). A good context tells the model the genre, speaker style, and
+  any unusual proper nouns. Examples:
+  - `"youtuber plays minecraft hypixel bedwars, hype casual commentary"`
+  - `"tech reviewer covers iphone 17 pro, neutral informative"`
+  - `"valorant ranked gameplay with friends, lots of trash talk and game slang"`
+- **Claude tends to produce the most natural idiomatic Chinese.** ChatGPT is solid; Gemini
+  Flash is fast but more literal. If quality matters more than cost/speed, try
+  `--translate-via claude --api-key sk-ant-...`.
+- **Batch size 20–30 works well.** The translator now passes the last few translated
+  pairs to each new batch as continuity context, so consistency is much better than v1.
+- Watch the run output for `lines unparsed (kept original english)` warnings — if those
+  appear, you have English fragments in your zh.srt; lower `--batch-size` and re-run.
+

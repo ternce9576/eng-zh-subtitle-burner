@@ -1,27 +1,31 @@
-import {
-	TRANSLATE_SYSTEM,
-	buildTranslatePrompt,
-	parseTranslateResponse,
-} from "./common.js";
+import type { ChatOptions } from "./common.js";
 
 export async function chatLocal(
 	systemMsg: string,
 	userMsg: string,
 	ollamaUrl: string,
 	model: string,
+	opts: ChatOptions = {},
 ): Promise<string> {
+	const body: Record<string, unknown> = {
+		model,
+		messages: [
+			{ role: "system", content: systemMsg },
+			{ role: "user", content: userMsg },
+		],
+		stream: false,
+		options: {
+			temperature: opts.temperature ?? 0.5,
+			num_ctx: 8192,
+			num_predict: opts.maxTokens ?? -1,
+		},
+	};
+	if (opts.jsonMode) body.format = "json";
+
 	const res = await fetch(`${ollamaUrl}/api/chat`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			model,
-			messages: [
-				{ role: "system", content: systemMsg },
-				{ role: "user", content: userMsg },
-			],
-			stream: false,
-			options: { temperature: 0.3, num_ctx: 4096 },
-		}),
+		body: JSON.stringify(body),
 	});
 
 	if (!res.ok) {
@@ -30,18 +34,4 @@ export async function chatLocal(
 
 	const data = (await res.json()) as { message: { content: string } };
 	return data.message.content;
-}
-
-export async function translateBatchLocal(
-	texts: string[],
-	ollamaUrl: string,
-	model: string,
-): Promise<string[]> {
-	const content = await chatLocal(
-		TRANSLATE_SYSTEM,
-		buildTranslatePrompt(texts),
-		ollamaUrl,
-		model,
-	);
-	return parseTranslateResponse(content, texts.length);
 }

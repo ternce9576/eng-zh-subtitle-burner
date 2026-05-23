@@ -11,8 +11,8 @@ import { fixOverlaps, parseSrt, splitLongEntries } from "./srt.js";
 import { transcribe } from "./transcribe.js";
 import {
 	type ApiProvider,
-	DEFAULT_API_MODELS,
 	checkOllamaGpu,
+	DEFAULT_API_MODELS,
 	fixTranscriptionSrt,
 	translateSrt,
 } from "./translate/index.js";
@@ -21,8 +21,7 @@ import { formatDuration, formatFileSize } from "./utils.js";
 const main = defineCommand({
 	meta: {
 		name: "subtitle-burner",
-		description:
-			"Transcribe, translate, and embed EN/ZH subtitles into video",
+		description: "Transcribe, translate, and embed EN/ZH subtitles into video",
 	},
 	args: {
 		input: {
@@ -52,7 +51,7 @@ const main = defineCommand({
 		},
 		preset: {
 			type: "string",
-			default: "p1",
+			default: "p4",
 			description: "Encoder preset (nvenc: p1-p7, cpu: ultrafast-veryslow)",
 		},
 		"translate-via": {
@@ -68,7 +67,8 @@ const main = defineCommand({
 		model: {
 			type: "string",
 			default: "qwen3:14b",
-			description: "Translation model name (local ollama or API model override)",
+			description:
+				"Translation model name (local ollama or API model override)",
 		},
 		"api-key": {
 			type: "string",
@@ -155,8 +155,7 @@ const main = defineCommand({
 
 		const defaultExt = soft ? ".mkv" : extname(input) || ".mp4";
 		const output = resolve(
-			args.output ??
-				`${input.replace(/\.[^.]+$/, "")}_subtitled${defaultExt}`,
+			args.output ?? `${input.replace(/\.[^.]+$/, "")}_subtitled${defaultExt}`,
 		);
 
 		consola.box("eng-zh-subtitle-burner");
@@ -193,17 +192,13 @@ const main = defineCommand({
 			if (useNvenc) {
 				consola.success("nvenc available — using GPU encoding");
 			} else {
-				consola.warn(
-					"nvenc not available — falling back to CPU encoding",
-				);
+				consola.warn("nvenc not available — falling back to CPU encoding");
 			}
 		}
 
 		if (
 			soft &&
-			![".mkv", ".mka", ".webm"].includes(
-				extname(output).toLowerCase(),
-			)
+			![".mkv", ".mka", ".webm"].includes(extname(output).toLowerCase())
 		) {
 			consola.warn(
 				`soft subs work best with MKV container; ${extname(output)} may not support ASS styling`,
@@ -217,21 +212,15 @@ const main = defineCommand({
 			const zhSrt = join(tmp, "zh.srt");
 			const assFile = join(tmp, "subtitles.ass");
 
-			const translateCfg: import("./translate/index.js").TranslateConfig =
-				{
-					via: isApi ? "api" : "local",
-					ollamaUrl,
-					localModel: modelName,
-					provider: isApi
-						? (translateVia as ApiProvider)
-						: undefined,
-					apiKey,
-					apiModel:
-						isApi && modelName !== "qwen3:14b"
-							? modelName
-							: undefined,
-					batchSize,
-				};
+			const translateCfg: import("./translate/index.js").TranslateConfig = {
+				via: isApi ? "api" : "local",
+				ollamaUrl,
+				localModel: modelName,
+				provider: isApi ? (translateVia as ApiProvider) : undefined,
+				apiKey,
+				apiModel: isApi && modelName !== "qwen3:14b" ? modelName : undefined,
+				batchSize,
+			};
 
 			if (!isApi) {
 				await checkOllamaGpu(ollamaUrl, modelName);
@@ -240,14 +229,10 @@ const main = defineCommand({
 			if (fixTranscription) {
 				await fixTranscriptionSrt(enSrt, translateCfg, context);
 			}
-			await translateSrt(enSrt, zhSrt, translateCfg);
+			await translateSrt(enSrt, zhSrt, translateCfg, context);
 
-			const enRaw = fixOverlaps(
-				parseSrt(readFileSync(enSrt, "utf-8")),
-			);
-			const zhRaw = fixOverlaps(
-				parseSrt(readFileSync(zhSrt, "utf-8")),
-			);
+			const enRaw = fixOverlaps(parseSrt(readFileSync(enSrt, "utf-8")));
+			const zhRaw = fixOverlaps(parseSrt(readFileSync(zhSrt, "utf-8")));
 			const { en: enEntries, zh: zhEntries } = splitLongEntries(
 				enRaw,
 				zhRaw,
@@ -278,10 +263,7 @@ const main = defineCommand({
 				});
 			}
 
-			const totalElapsed = (
-				(Date.now() - pipelineT0) /
-				1000
-			).toFixed(1);
+			const totalElapsed = ((Date.now() - pipelineT0) / 1000).toFixed(1);
 			consola.success(`done in ${totalElapsed}s! output: ${output}`);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });

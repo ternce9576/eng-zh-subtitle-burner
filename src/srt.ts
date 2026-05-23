@@ -72,9 +72,38 @@ export function sanitizeSrtText(text: string): string {
 		.trim();
 }
 
+// Snap a Chinese split index to the nearest punctuation boundary (within ±4 chars).
+// Prefers strong boundaries (。！？) over commas (，、) over weak (；：).
+const ZH_PUNCT_STRONG = new Set(["。", "！", "？", "!", "?", ".", "\n"]);
+const ZH_PUNCT_MID = new Set(["，", "、", ",", "—", "…"]);
+const ZH_PUNCT_WEAK = new Set(["；", "：", ";", ":", " "]);
+
+function snapZhBoundary(chars: string[], target: number, window = 4): number {
+	const lo = Math.max(1, target - window);
+	const hi = Math.min(chars.length - 1, target + window);
+	let bestStrong = -1;
+	let bestMid = -1;
+	let bestWeak = -1;
+	const dist = (i: number) => Math.abs(i - target);
+	for (let i = lo; i <= hi; i++) {
+		const ch = chars[i - 1];
+		if (ZH_PUNCT_STRONG.has(ch)) {
+			if (bestStrong === -1 || dist(i) < dist(bestStrong)) bestStrong = i;
+		} else if (ZH_PUNCT_MID.has(ch)) {
+			if (bestMid === -1 || dist(i) < dist(bestMid)) bestMid = i;
+		} else if (ZH_PUNCT_WEAK.has(ch)) {
+			if (bestWeak === -1 || dist(i) < dist(bestWeak)) bestWeak = i;
+		}
+	}
+	if (bestStrong !== -1) return bestStrong;
+	if (bestMid !== -1) return bestMid;
+	if (bestWeak !== -1) return bestWeak;
+	return target;
+}
+
 /**
  * Split a paired EN/ZH entry into chunks of at most `maxWords` English words.
- * The Chinese text is split proportionally by character count.
+ * Chinese is split at the nearest punctuation boundary to the proportional cut.
  * Time is distributed proportionally by English word count per chunk.
  */
 export function splitEntryPair(
@@ -92,7 +121,7 @@ export function splitEntryPair(
 		return { en: [en], zh: [zh] };
 	}
 
-	const zhChars = [...zh.text.replace(/\s+/g, "")];
+	const zhChars = [...zh.text.replace(/\s\s+/g, " ")];
 	const totalEnWords = enWords.length;
 	const totalZhChars = zhChars.length;
 
@@ -112,18 +141,30 @@ export function splitEntryPair(
 		seq++;
 		enOut.push({ index: seq, time, text: chunkWords.join(" ") });
 
-		// Split Chinese proportionally
-		const zhChunkLen = Math.round(
-			(chunkWords.length / totalEnWords) * totalZhChars,
-		);
-		const zhChunk = zhChars.slice(zhIdx, zhIdx + zhChunkLen).join("");
+		const isLast = chunkEndWord >= totalEnWords;
+		let zhEndIdx: number;
+		if (isLast) {
+			zhEndIdx = totalZhChars;
+		} else {
+			const proportional =
+				zhIdx + Math.round((chunkWords.length / totalEnWords) * totalZhChars);
+			zhEndIdx = snapZhBoundary(
+				zhChars,
+				Math.min(proportional, totalZhChars - 1),
+			);
+			if (zhEndIdx <= zhIdx) zhEndIdx = Math.min(zhIdx + 1, totalZhChars);
+		}
+		const zhChunk = zhChars
+			.slice(zhIdx, zhEndIdx)
+			.join("")
+			.replace(/^[，、,;\s]+/, "")
+			.trim();
 		zhOut.push({ index: seq, time, text: zhChunk || zh.text });
-		zhIdx += zhChunkLen;
+		zhIdx = zhEndIdx;
 
 		enIdx += maxWords;
 	}
 
-	// Assign any remaining Chinese characters to the last chunk
 	if (zhIdx < totalZhChars && zhOut.length > 0) {
 		zhOut[zhOut.length - 1].text += zhChars.slice(zhIdx).join("");
 	}
