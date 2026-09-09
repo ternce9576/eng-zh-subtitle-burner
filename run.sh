@@ -181,6 +181,40 @@ video_is_intact() {
 
 ledger_has() { grep -qxF "$1" "$LEDGER" 2>/dev/null; }
 
+# A video that fails for a structural reason -- a corrupt download, an
+# unsupported stream -- fails identically every hour, forever. Count attempts
+# so it gets set aside and reported instead of quietly eating a GPU slot on
+# every run.
+BURN_ATTEMPTS="$STATE_DIR/burn-attempts.tsv"
+MAX_BURN_ATTEMPTS="${MAX_BURN_ATTEMPTS:-3}"
+
+burn_attempts_for() {
+  grep -m1 -F "$1	" "$BURN_ATTEMPTS" 2>/dev/null | cut -f2
+}
+
+burn_exhausted() {
+  local n; n=$(burn_attempts_for "$1")
+  [[ -n "$n" ]] && (( n >= MAX_BURN_ATTEMPTS ))
+}
+
+# Called from parallel burn jobs, so the read-modify-write needs serialising.
+record_burn_failure() {
+  local key="$1" n
+  exec 8>>"$STATE_DIR/.attempts.lock"; flock 8
+  n=$(burn_attempts_for "$key"); n=$(( ${n:-0} + 1 ))
+  mkdir -p "$STATE_DIR"; touch "$BURN_ATTEMPTS"
+  grep -v -F "$key	" "$BURN_ATTEMPTS" > "$BURN_ATTEMPTS.tmp" 2>/dev/null || true
+  printf '%s\t%s\n' "$key" "$n" >> "$BURN_ATTEMPTS.tmp"
+  mv -f "$BURN_ATTEMPTS.tmp" "$BURN_ATTEMPTS"
+  printf '%s' "$n"
+}
+
+clear_burn_failures() {
+  [[ -f "$BURN_ATTEMPTS" ]] || return 0
+  grep -v -F "$1	" "$BURN_ATTEMPTS" > "$BURN_ATTEMPTS.tmp" 2>/dev/null || true
+  mv -f "$BURN_ATTEMPTS.tmp" "$BURN_ATTEMPTS"
+}
+
 ensure_ytdlp_fresh() {
   local stamp="$STATE_DIR/ytdlp-updated" now age
   now=$(date +%s)
@@ -191,9 +225,22 @@ ensure_ytdlp_fresh() {
   local before after
   before=$(yt-dlp --version 2>/dev/null)
   log "Refreshing yt-dlp (last checked ${age:-never} days ago)"
-  python3 -m pip install -U yt-dlp >/dev/null 2>&1 \
-    || pip install -U yt-dlp >/dev/null 2>&1 \
-    || echo "  warning: could not update yt-dlp" >&2
+  # Prefer the standalone build: it bundles its own Python, so updates keep
+  # arriving after yt-dlp drops support for whatever the distro ships. A stale
+  # yt-dlp means HTTP 403 on every download, which reads as "creator posted
+  # nothing" -- a silent miss, the one failure mode that matters here.
+  if [[ -w "$(dirname "$(command -v yt-dlp 2>/dev/null || echo /usr/local/bin/yt-dlp)")" ]] \
+     && curl -fsSL -o "$STATE_DIR/yt-dlp.new" \
+          "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux" 2>/dev/null \
+     && chmod +x "$STATE_DIR/yt-dlp.new" \
+     && "$STATE_DIR/yt-dlp.new" --version >/dev/null 2>&1; then
+    mv -f "$STATE_DIR/yt-dlp.new" "$(command -v yt-dlp 2>/dev/null || echo /usr/local/bin/yt-dlp)"
+  else
+    rm -f "$STATE_DIR/yt-dlp.new"
+    python3 -m pip install -U yt-dlp >/dev/null 2>&1 \
+      || pip install -U yt-dlp >/dev/null 2>&1 \
+      || echo "  warning: could not update yt-dlp" >&2
+  fi
   after=$(yt-dlp --version 2>/dev/null)
   echo "$now" > "$stamp"
   if [[ -n "$after" && "$before" != "$after" ]]; then
@@ -230,6 +277,49 @@ fi
 processed=0; skipped=0; failed=0; broken=0
 declare -a ready=()
 
+# Burning one video at a time leaves the machine idle. Measured on an RTX
+# 5070 Ti, each concurrent burn costs roughly 23% of the NVENC encoder: two
+# jobs sat at 51%, four at 89-95% -- saturated, and the machine felt slow to
+# use. Three is the practical ceiling. Higher also multiplies whisper's VRAM
+# copies and the per-video translation concurrency into API rate limits.
+MAX_PARALLEL="${MAX_PARALLEL:-3}"
+JOB_DIR=$(mktemp -d)
+trap 'rm -rf "$JOB_DIR"' EXIT
+
+# Runs one video to completion and does its own bookkeeping, because a
+# background job cannot update the parent's counters. Results are left as
+# files for the parent to tally once every job has finished.
+burn_one() {
+  local video="$1" creator="$2" base="$3" out_dir="$4" tag="$5"; shift 5
+  local rc=0
+  # Two jobs write to the same log, so every line is prefixed with the video
+  # it belongs to -- otherwise the two progress bars are indistinguishable.
+  { "./$BURNER_DIR/run.sh" "$@" </dev/null; echo $? > "$JOB_DIR/rc.$tag"; } 2>&1 \
+    | sed -u "s/^/[$base] /"
+  rc=$(cat "$JOB_DIR/rc.$tag" 2>/dev/null || echo 1)
+
+  if [[ "$rc" == "0" ]]; then
+    # A single short append is atomic on Linux, so concurrent jobs can share
+    # the ledger without a lock.
+    echo "$creator/$base" >> "$LEDGER"
+    clear_burn_failures "$creator/$base"
+    [[ -f "$NEW_DIR/$creator/$base.jpg" ]] && mv -f -- "$NEW_DIR/$creator/$base.jpg" "$out_dir/"
+    [[ "$DELETE_SOURCE" == "1" ]] && rm -f -- "$video"
+    printf '%s\n' "$base" > "$JOB_DIR/ok.$tag"
+  else
+    local attempts
+    attempts=$(record_burn_failure "$creator/$base")
+    echo "$(date -Is) FAILED (attempt $attempts/$MAX_BURN_ATTEMPTS) $video" >> "$FAIL_LOG"
+    if (( attempts >= MAX_BURN_ATTEMPTS )); then
+      echo "!! failed: $base — giving up after $attempts attempts" >&2
+    else
+      echo "!! failed: $base (attempt $attempts/$MAX_BURN_ATTEMPTS)" >&2
+    fi
+    printf '%s\n' "$base" > "$JOB_DIR/fail.$tag"
+  fi
+}
+
+job_tag=0
 if [[ $AUDIT_ONLY -eq 0 ]]; then
   while IFS= read -r -d '' video; do
     rel="${video#$NEW_DIR/}"
@@ -241,6 +331,10 @@ if [[ $AUDIT_ONLY -eq 0 ]]; then
     # The ledger — not the presence of the output file — is the record of
     # completion, so you can delete an uploaded video without it coming back.
     if ledger_has "$creator/$base"; then skipped=$((skipped+1)); continue; fi
+    if burn_exhausted "$creator/$base"; then
+      broken=$((broken+1))
+      continue
+    fi
 
     if ! video_is_intact "$video"; then
       broken=$((broken+1))
@@ -290,18 +384,20 @@ if [[ $AUDIT_ONLY -eq 0 ]]; then
     [[ -n "$MODEL" ]] && args+=(--model "$MODEL")
     [[ "$FIX_TRANSCRIPTION" == "1" ]] && args+=(--fix-transcription)
 
-    if "./$BURNER_DIR/run.sh" "${args[@]}" </dev/null; then
-      processed=$((processed+1))
-      ready+=("$base")
-      echo "$creator/$base" >> "$LEDGER"
-      [[ -f "$NEW_DIR/$creator/$base.jpg" ]] && mv -f -- "$NEW_DIR/$creator/$base.jpg" "$out_dir/"
-      [[ "$DELETE_SOURCE" == "1" ]] && rm -f -- "$video"
-    else
-      failed=$((failed+1))
-      echo "$(date -Is) FAILED $video" >> "$FAIL_LOG"
-      echo "!! failed: $base" >&2
-    fi
-  done < <(find "$NEW_DIR" -type f \( -name '*.mkv' -o -name '*.mp4' \) -print0 | sort -z)
+    # Wait for a free slot before starting the next one.
+    while (( $(jobs -rp | wc -l) >= MAX_PARALLEL )); do wait -n; done
+    job_tag=$((job_tag + 1))
+    burn_one "$video" "$creator" "$base" "$out_dir" "$job_tag" "${args[@]}" </dev/null &
+  # An interrupted download leaves fragments like "Title.f299.mp4" behind.
+  # Without the prune they are queued as videos, fail, and are retried on
+  # every single run.
+  done < <(find "$NEW_DIR" -type f \( -name '*.mkv' -o -name '*.mp4' \) \
+             ! -name '*.f[0-9]*.mp4' ! -name '*.part' -print0 | sort -z)
+
+  wait
+  processed=$(ls "$JOB_DIR"/ok.* 2>/dev/null | wc -l)
+  failed=$((failed + $(ls "$JOB_DIR"/fail.* 2>/dev/null | wc -l)))
+  mapfile -t ready < <(cat "$JOB_DIR"/ok.* 2>/dev/null)
 fi
 
 # ---------------------------------------------------------------------------

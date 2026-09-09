@@ -1,7 +1,7 @@
-# donwload in highest quality possible, takes thumbnails and eng srt. Skips members, adds its video id, 
-# then echos missing ids at the end
-
 #!/bin/bash
+# Downloads new uploads in the best available quality with their thumbnails,
+# skips members-only and age-restricted videos, and reports any ids that are
+# still missing at the end.
 # source /mnt/c/Users/ternc/myenv/bin/activate
 
 set -u
@@ -10,7 +10,6 @@ set -o pipefail
 CHANNELS_FILE="channels.txt"
 INPUT_DIR="incoming"          # downloads stored under incoming/<creator>/
 DONE_DIR="done"          # thumbnails archived under done/<creator>/
-SUBS_DIR="sub"           # where we store final chosen SRTs
 DOWNLOAD_LIMIT="${DOWNLOAD_LIMIT:-10}"
 STATE_DIR=".state"
 SKIP_LIST=""
@@ -32,7 +31,7 @@ consecutive_failures=0
 command -v yt-dlp >/dev/null 2>&1 || { echo "Error: yt-dlp not found in PATH." >&2; exit 1; }
 command -v ffmpeg  >/dev/null 2>&1 || { echo "Error: ffmpeg not found in PATH." >&2; exit 1; }
 
-mkdir -p "$INPUT_DIR" "$DONE_DIR" "$SUBS_DIR/raw"
+mkdir -p "$INPUT_DIR" "$DONE_DIR"
 
 normalize_channels() {
   sed -i -e 's/\r$//' -e '$a\' "$CHANNELS_FILE"
@@ -53,6 +52,7 @@ YTDLP_COMMON=(
   --retries infinite
   --fragment-retries infinite
   -N 4
+  --no-progress
   --no-part
   --no-continue
   --force-overwrites
@@ -61,74 +61,15 @@ YTDLP_COMMON=(
   --min-sleep-interval 1
   --max-sleep-interval 3
 
-  # subtitles: fetch both human+auto; we’ll pick ONE afterwards
-  --sub-format "srt/best"
-  --sub-langs "en,en.*,en-orig"
-  --write-subs
-  --write-auto-subs
+  # No subtitles. YouTube's are rolling auto-captions with overlapping
+  # timestamps, and the pipeline transcribes with whisper anyway -- it needs
+  # word-level timings and its own segmentation, which a downloaded SRT
+  # cannot provide. Fetching them was two wasted requests per video.
 
   # thumbnails
   --write-thumbnail
   --convert-thumbnails jpg
 )
-
-# Choose ONE SRT (prefer human EN) -> move to sub/raw/<Title>.srt; remove others
-pick_and_stage_one_sub() {
-  local outdir="$1"
-  local title_base="$2"            # e.g., "What's The BEST Ping?"
-
-  # Find the MKV (final video)
-  local mkv
-  mkv=$(ls -t "$outdir/${title_base}.mkv" 2>/dev/null | head -n 1 || true)
-  [[ -n "${mkv:-}" ]] || return 0
-
-  # Find all SRTs that belong to this title
-  mapfile -t srts < <(ls "$outdir/${title_base}".*.srt 2>/dev/null || true)
-  # yt-dlp may also save a plain "<title>.srt"
-  if [[ -f "$outdir/${title_base}.srt" ]]; then
-    srts+=("$outdir/${title_base}.srt")
-  fi
-  [[ ${#srts[@]} -gt 0 ]] || return 0
-
-  local best=""
-
-  # 1) Exact human 'en.srt'
-  if [[ -f "$outdir/${title_base}.en.srt" ]]; then
-    best="$outdir/${title_base}.en.srt"
-  fi
-
-  # 2) Any 'en-*.srt' that is NOT 'en-orig'
-  if [[ -z "$best" ]]; then
-    for s in "${srts[@]}"; do
-      bn="${s##*/}"
-      if [[ "$bn" == "${title_base}.en-"*".srt" && "$bn" != "${title_base}.en-orig.srt" ]]; then
-        best="$s"; break
-      fi
-    done
-  fi
-
-  # 3) Auto captions 'en-orig.srt'
-  if [[ -z "$best" && -f "$outdir/${title_base}.en-orig.srt" ]]; then
-    best="$outdir/${title_base}.en-orig.srt"
-  fi
-
-  # 4) Any remaining .srt
-  if [[ -z "$best" ]]; then
-    best="${srts[0]}"
-  fi
-
-  # Stage chosen SRT to sub/raw with simple name "<Title>.srt"
-  if [[ -n "$best" && -f "$best" ]]; then
-    mkdir -p "$SUBS_DIR/raw"
-    local staged="$SUBS_DIR/raw/${title_base}.srt"
-    mv -f -- "$best" "$staged"
-
-    # Delete all other SRTs next to the video
-    for s in "${srts[@]}"; do
-      [[ "$s" != "$staged" && -f "$s" ]] && rm -f -- "$s"
-    done
-  fi
-}
 
 download_try() {
   local video_id="$1"
@@ -274,7 +215,6 @@ fetch_next_video() {
       mkv=$(ls -t "$dir"/*.mkv 2>/dev/null | head -n 1 || true)
       if [[ -n "${mkv:-}" ]]; then
         local title_base; title_base="$(basename "$mkv" .mkv)"
-        pick_and_stage_one_sub "$dir" "$title_base"
       fi
       return 0
     else
