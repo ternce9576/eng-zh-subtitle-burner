@@ -15,6 +15,9 @@ services:
     ports:
       - "11434:11434"
 
+  # ollama is deliberately NOT a depends_on: every API run would then have to
+  # keep an 8.4GB image around for a service it never talks to. run.sh starts
+  # ollama itself when --translate-via local is asked for.
   worker:
     build: .
     deploy:
@@ -24,8 +27,6 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    depends_on:
-      - ollama
     volumes:
       - ${HOST_DIR:-.}:/data
       - hf_cache:/root/.cache/huggingface

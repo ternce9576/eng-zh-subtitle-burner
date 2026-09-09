@@ -77,10 +77,11 @@ subtitle-burner <input> [options]
 | Flag | Description |
 |---|---|
 | `--translate-via <mode>` | `local` (default), `chatgpt`, `gemini`, or `claude` |
-| `--api-key <key>` | API key (required for chatgpt/gemini/claude) |
+| `--api-key <key>` | API key. Falls back to `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, which is preferred — a key on the command line is visible via `ps` and `docker inspect`. |
 | `--model <name>` | Model name — local ollama model or API model override (default: `qwen3:14b`) |
 | `--ollama-url <url>` | Ollama server URL (default: `http://ollama:11434`) |
 | `--batch-size <n>` | Translation batch size (default: 20) |
+| `--concurrency <n>` | Batches sent in parallel (default: 4, `1` = sequential). The API stages are ~89% of runtime, so this is the main speed lever. |
 | `--fix-transcription` | Use AI to fix misheard words in transcription before translating |
 | `--context <text>` | Additional context for AI — passed to both transcription fix AND translation. Strongly recommended for any video with jargon, slang, or proper nouns (e.g. `"youtuber plays minecraft hypixel bedwars, casual gaming commentary"`) |
 

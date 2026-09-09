@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { consola } from "consola";
 
 export interface ProbeResult {
 	format: string;
@@ -62,8 +63,46 @@ export function checkNvenc(): boolean {
 			encoding: "utf-8",
 			stdio: ["pipe", "pipe", "pipe"],
 		});
-		return result.includes("h264_nvenc");
+		if (!result.includes("h264_nvenc")) return false;
 	} catch {
 		return false;
+	}
+
+	// Being compiled in doesn't mean it runs — the driver may be older than the
+	// nvenc API ffmpeg was built against. Actually encode a frame to find out.
+	// This is a hard failure: a machine with an NVENC-capable GPU should never
+	// silently drop to CPU encoding, it should be fixed.
+	try {
+		execFileSync(
+			"ffmpeg",
+			[
+				"-hide_banner",
+				"-loglevel",
+				"error",
+				"-f",
+				"lavfi",
+				"-i",
+				// nvenc rejects frames below its minimum dimensions, so keep this
+				// comfortably above them or the probe false-negatives.
+				"nullsrc=s=256x256:d=0.1",
+				"-c:v",
+				"h264_nvenc",
+				"-frames:v",
+				"1",
+				"-f",
+				"null",
+				"-",
+			],
+			{ encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+		);
+		return true;
+	} catch (err) {
+		const stderr = (err as { stderr?: string }).stderr ?? "";
+		consola.error("h264_nvenc is present but cannot encode:");
+		if (stderr.trim()) consola.error(stderr.trim());
+		consola.error(
+			"this is usually an NVIDIA driver older than the nvenc API ffmpeg was built against — update your driver, or pin an older ffmpeg build in the Dockerfile",
+		);
+		process.exit(1);
 	}
 }

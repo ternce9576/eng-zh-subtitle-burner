@@ -1,14 +1,23 @@
 #!/usr/bin/env node
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { defineCommand, runMain } from "citty";
 import { consola } from "consola";
 import { generateAss } from "./ass.js";
 import { burnSubtitles, muxSubtitles } from "./encode.js";
 import { checkNvenc, probeInput } from "./probe.js";
+import { loadGlossary } from "./glossary.js";
 import { fixOverlaps, parseSrt, splitLongEntries } from "./srt.js";
 import { transcribe } from "./transcribe.js";
+import { UNTRANSLATED } from "./translate/common.js";
 import {
 	type ApiProvider,
 	checkOllamaGpu,
@@ -34,10 +43,14 @@ const main = defineCommand({
 			alias: "o",
 			description: "Output file path",
 		},
-		"no-english": {
+		// NOTE: must NOT be named "no-english" — citty parses a `--no-x` flag as
+		// negating `x`, so `--no-english` silently resolved to false and the
+		// option never worked. `--no-english` is still accepted below via a
+		// direct argv check for backwards compatibility.
+		"chinese-only": {
 			type: "boolean",
 			default: false,
-			description: "Only show Chinese subtitles (omit English)",
+			description: "Only burn Chinese subtitles (omit English)",
 		},
 		soft: {
 			type: "boolean",
@@ -46,12 +59,12 @@ const main = defineCommand({
 		},
 		crf: {
 			type: "string",
-			default: "23",
-			description: "CRF quality for burn mode (lower = better)",
+			default: "28",
+			description: "CRF/CQ quality for burn mode (lower = better, bigger)",
 		},
 		preset: {
 			type: "string",
-			default: "p4",
+			default: "p6",
 			description: "Encoder preset (nvenc: p1-p7, cpu: ultrafast-veryslow)",
 		},
 		"translate-via": {
@@ -72,7 +85,8 @@ const main = defineCommand({
 		},
 		"api-key": {
 			type: "string",
-			description: "API key (required for chatgpt/gemini/claude)",
+			description:
+				"API key (falls back to GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY)",
 		},
 		"fix-transcription": {
 			type: "boolean",
@@ -90,10 +104,40 @@ const main = defineCommand({
 			default: "20",
 			description: "Translation batch size",
 		},
+		concurrency: {
+			type: "string",
+			default: "4",
+			description: "Batches sent in parallel (1 = fully sequential)",
+		},
+		glossary: {
+			type: "string",
+			description:
+				"Creator term list (English => 中文, one per line). Biases transcription and pins translations.",
+		},
+		"ass-out": {
+			type: "string",
+			description:
+				"Where to write the generated .ass (default: beside the output video)",
+		},
 		"whisper-model": {
 			type: "string",
 			default: "deepdml/faster-whisper-large-v3-turbo-ct2",
 			description: "Whisper model name",
+		},
+		"en-font": {
+			type: "string",
+			default: "Poppins ExtraBold",
+			description: "English subtitle font family",
+		},
+		"zh-font": {
+			type: "string",
+			default: "Smiley Sans",
+			description: "Chinese subtitle font family",
+		},
+		outline: {
+			type: "string",
+			default: "2.5",
+			description: "Subtitle outline thickness",
 		},
 		"en-font-size": {
 			type: "string",
@@ -120,7 +164,8 @@ const main = defineCommand({
 		const pipelineT0 = Date.now();
 
 		const input = resolve(args.input);
-		const noEnglish = args["no-english"];
+		const noEnglish =
+			args["chinese-only"] || process.argv.includes("--no-english");
 		const soft = args.soft;
 		const crfVal = parseInt(args.crf, 10);
 		const preset = args.preset;
@@ -128,15 +173,43 @@ const main = defineCommand({
 		const isApi = translateVia !== "local";
 		const ollamaUrl = args["ollama-url"];
 		const modelName = args.model;
-		const apiKey = args["api-key"];
+		// Prefer the environment over --api-key: a key passed as an argument is
+		// visible to anyone who can run `ps` or `docker inspect`, and lands in
+		// shell history. The flag still works for one-off overrides.
+		const ENV_KEY_FOR: Record<ApiProvider, string> = {
+			claude: "ANTHROPIC_API_KEY",
+			chatgpt: "OPENAI_API_KEY",
+			gemini: "GEMINI_API_KEY",
+		};
+		const envVar =
+			translateVia !== "local" ? ENV_KEY_FOR[translateVia as ApiProvider] : undefined;
+		const apiKey = args["api-key"] ?? (envVar ? process.env[envVar] : undefined);
 		const fixTranscription = args["fix-transcription"];
-		const context = args.context;
+		const glossary = loadGlossary(args.glossary);
+		// Glossary terms ride along with the channel context: the translator sees
+		// them as hard rules, whisper sees the English side as hotwords.
+		const context = [args.context, glossary.promptBlock]
+			.filter(Boolean)
+			.join("\n\n");
 		const batchSize = parseInt(args["batch-size"], 10);
+		const concurrency = Math.max(1, parseInt(args.concurrency, 10) || 1);
 		const whisperModel = args["whisper-model"];
+		const assOut = args["ass-out"];
+		const enFont = args["en-font"];
+		const zhFont = args["zh-font"];
+		const outline = parseFloat(args.outline);
 		const enFontSize = parseInt(args["en-font-size"], 10);
 		const zhFontSize = parseInt(args["zh-font-size"], 10);
 		const marginVEn = parseInt(args["margin-v-en"], 10);
-		const marginVZh = parseInt(args["margin-v-zh"], 10);
+		// With both languages the Chinese line sits above the English one. With
+		// --chinese-only it drops into the English line's slot at the bottom of
+		// the frame -- unless a margin is given explicitly, which is how a creator
+		// who burns their own captions mid-frame gets ours placed above theirs.
+		const marginVZhSet = process.argv.some(
+			(a) => a === "--margin-v-zh" || a.startsWith("--margin-v-zh="),
+		);
+		const marginVZh =
+			!noEnglish || marginVZhSet ? parseInt(args["margin-v-zh"], 10) : marginVEn;
 
 		if (isApi) {
 			if (!["claude", "chatgpt", "gemini"].includes(translateVia)) {
@@ -147,13 +220,15 @@ const main = defineCommand({
 			}
 			if (!apiKey) {
 				consola.error(
-					`--api-key is required when using --translate-via ${translateVia}`,
+					`no API key for ${translateVia} — set ${envVar} or pass --api-key`,
 				);
 				process.exit(1);
 			}
 		}
 
-		const defaultExt = soft ? ".mkv" : extname(input) || ".mp4";
+		// Burned output defaults to MP4 — Bilibili won't accept MKV. Soft subs
+		// still have to be MKV because MP4 can't carry an ASS track.
+		const defaultExt = soft ? ".mkv" : ".mp4";
 		const output = resolve(
 			args.output ?? `${input.replace(/\.[^.]+$/, "")}_subtitled${defaultExt}`,
 		);
@@ -175,7 +250,7 @@ const main = defineCommand({
 			`output: ${basename(output)} (${soft ? "soft subs" : `burn, crf=${crfVal}`})`,
 		);
 		if (noEnglish) {
-			consola.info("mode: chinese only (--no-english)");
+			consola.info("mode: chinese only");
 		}
 		if (isApi) {
 			const apiModel =
@@ -220,23 +295,51 @@ const main = defineCommand({
 				apiKey,
 				apiModel: isApi && modelName !== "qwen3:14b" ? modelName : undefined,
 				batchSize,
+				concurrency,
 			};
 
 			if (!isApi) {
 				await checkOllamaGpu(ollamaUrl, modelName);
 			}
-			transcribe(input, enSrt, whisperModel);
+			// Stage numbering is computed up front so the labels read
+			// "[2/4]" or "[2/3]" depending on whether --fix-transcription
+			// adds its pass.
+			const totalStages = fixTranscription ? 4 : 3;
+			let stageNum = 0;
+			const nextStage = () => `${++stageNum}/${totalStages}`;
+
+			await transcribe(
+				input,
+				enSrt,
+				whisperModel,
+				nextStage(),
+				glossary.hotwords,
+			);
 			if (fixTranscription) {
-				await fixTranscriptionSrt(enSrt, translateCfg, context);
+				await fixTranscriptionSrt(
+					enSrt,
+					translateCfg,
+					context,
+					nextStage(),
+				);
 			}
-			await translateSrt(enSrt, zhSrt, translateCfg, context);
+			const translateResult = await translateSrt(
+				enSrt,
+				zhSrt,
+				translateCfg,
+				context,
+				nextStage(),
+			);
 
 			const enRaw = fixOverlaps(parseSrt(readFileSync(enSrt, "utf-8")));
 			const zhRaw = fixOverlaps(parseSrt(readFileSync(zhSrt, "utf-8")));
+			// Bilibili gaming subtitles cut fast — one short clause per card.
+			// A high threshold here lets whole sentences ride on a single
+			// subtitle, which flattens the punchy register the prompt asks for.
 			const { en: enEntries, zh: zhEntries } = splitLongEntries(
 				enRaw,
 				zhRaw,
-				16,
+				9,
 			);
 			consola.info(
 				`subtitle entries: ${enEntries.length} EN, ${zhEntries.length} ZH (split from ${enRaw.length} segments)`,
@@ -250,21 +353,74 @@ const main = defineCommand({
 					zhFontSize,
 					marginVEn,
 					marginVZh,
+					enFont,
+					zhFont,
+					outline,
 				}),
 				"utf-8",
 			);
 
+			// Keep the ASS next to the finished video. It's the only durable
+			// record of what was actually rendered — the temp dir is deleted on
+			// exit, and burned-in subtitles can't be read back out of the file.
+			const assCopy = assOut
+				? resolve(assOut)
+				: `${output.replace(/\.[^.]+$/, "")}.ass`;
+			mkdirSync(dirname(assCopy), { recursive: true });
+			copyFileSync(assFile, assCopy);
+			consola.info(`subtitles: ${assCopy}`);
+
+			const srtBase = assCopy.replace(/\.ass$/i, "");
+
 			if (soft) {
 				muxSubtitles(input, assFile, output);
 			} else {
-				burnSubtitles(input, assFile, output, useNvenc, {
-					crf: crfVal,
-					preset,
-				});
+				await burnSubtitles(
+					input,
+					assFile,
+					output,
+					useNvenc,
+					{ crf: crfVal, preset, audioCodec: probe.audioCodec },
+					probe.duration,
+					nextStage(),
+				);
 			}
 
 			const totalElapsed = ((Date.now() - pipelineT0) / 1000).toFixed(1);
 			consola.success(`done in ${totalElapsed}s! output: ${output}`);
+
+			// Loud, last-thing-on-screen report. The per-batch warnings scroll
+			// away behind thousands of ffmpeg progress lines, so anything that
+			// needs attention gets repeated here after the encode.
+			if (translateResult.untranslated.length > 0) {
+				const n = translateResult.untranslated.length;
+				// Only written when something went wrong -- these exist so the
+				// failed lines can be fixed and remuxed, not as a routine artifact.
+				const enCopy = `${srtBase}.en.srt`;
+				const zhCopy = `${srtBase}.zh.srt`;
+				copyFileSync(enSrt, enCopy);
+				copyFileSync(zhSrt, zhCopy);
+
+				const shown = translateResult.untranslated.slice(0, 25).join(", ");
+				const more = n > 25 ? ` (+${n - 25} more)` : "";
+				consola.box(
+					[
+						`⚠  PIPELINE NEEDS ATTENTION`,
+						``,
+						`${n} of ${translateResult.total} subtitles failed to translate and were`,
+						`left BLANK in the video — those moments have no Chinese subtitle.`,
+						``,
+						`Subtitle numbers: ${shown}${more}`,
+						``,
+						`Sidecar files written (search for "${UNTRANSLATED}"):`,
+						`  ${zhCopy}`,
+						`  ${enCopy}`,
+						``,
+						`Fix those lines, then re-run with --soft to remux quickly,`,
+						`or lower --batch-size and translate again.`,
+					].join("\n"),
+				);
+			}
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
