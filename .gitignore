@@ -1,6 +1,25 @@
-node_modules
-dist
+# Media and pipeline state: large, machine-specific, and regenerated.
+incoming/
+done/
+sub/
+.state/
+new/
+
+# Credentials. cookies.txt is a signed-in YouTube session — full account access.
+cookies.txt
+*.env
+
+# Build output and dependencies
+node_modules/
+dist/
+
+# Stray media
 *.mp4
 *.mkv
 *.avi
 *.mov
+*.webp
+
+# Local Claude Code permissions, machine-specific
+.claude/
+package-lock.json

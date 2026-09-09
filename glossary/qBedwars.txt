@@ -1,0 +1,29 @@
+# qBedwars — Minecraft / Hypixel Bed Wars commentary.
+# Left side biases transcription. Add '=> 中文' to pin a translation.
+# Seeded from video titles, then curated.
+
+# --- game modes and maps ---
+Bed Wars => 起床战争
+Bedwars => 起床战争
+Ranked Bedwars => 排位起床战争
+SkyWars => 空岛战争
+Skyblock => 空岛生存
+Murder Mystery => 密室杀手
+
+# --- mechanics, techniques, blocks ---
+speed bridge => 速搭
+bridging => 搭路
+ender pearl => 末影珍珠
+knockback => 击退
+the void => 虚空
+generator => 资源点
+spawn => 出生点
+creeper => 苦力怕
+obsidian => 黑曜石
+pickaxe => 镐
+golden apple => 金苹果
+
+# --- names: get them right, keep them in English ---
+Hypixel
+Lunar Client
+Minecraft

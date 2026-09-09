@@ -1,0 +1,36 @@
+# Ken (kenforrest) — Clash Royale ladder gameplay with facecam commentary.
+# Left side biases transcription. Add '=> 中文' to pin a translation.
+
+# --- the game ---
+Clash Royale => 皇室战争
+elixir => 圣水
+deck => 卡组
+cycle => 过牌
+ladder => 天梯
+King Tower => 国王塔
+Princess Tower => 公主塔
+tower => 塔
+
+# --- cards ---
+Hog Rider => 野猪骑士
+Mega Knight => 超级骑士
+Musketeer => 火枪手
+Valkyrie => 瓦基丽武神
+Skeleton Army => 骷髅军团
+Lava Hound => 熔岩猎犬
+Electro Giant => 电磁巨人
+Goblin Gang => 哥布林飞斧帮
+Balloon => 气球兵
+Fireball => 火球
+Arrows => 弓箭
+Zap => 电击
+The Log => 滚木
+Miner => 矿工
+Golem => 戈仑石人
+Wizard => 法师
+Giant => 巨人
+Bats => 蝙蝠
+Pekka => 皮卡
+
+# --- names: keep in English ---
+Supercell
