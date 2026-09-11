@@ -15,6 +15,7 @@ import { generateAss } from "./ass.js";
 import { burnSubtitles, muxSubtitles } from "./encode.js";
 import { checkNvenc, probeInput } from "./probe.js";
 import { loadGlossary } from "./glossary.js";
+import { translateTitle } from "./title.js";
 import { fixOverlaps, parseSrt, splitLongEntries } from "./srt.js";
 import { transcribe } from "./transcribe.js";
 import { UNTRANSLATED } from "./translate/common.js";
@@ -36,7 +37,7 @@ const main = defineCommand({
 		input: {
 			type: "positional",
 			description: "Input video file",
-			required: true,
+			required: false,
 		},
 		output: {
 			type: "string",
@@ -47,6 +48,11 @@ const main = defineCommand({
 		// negating `x`, so `--no-english` silently resolved to false and the
 		// option never worked. `--no-english` is still accepted below via a
 		// direct argv check for backwards compatibility.
+		"translate-title": {
+			type: "string",
+			description:
+				"Translate this one title to Chinese, print it, and exit. Used by the Bilibili upload step.",
+		},
 		"chinese-only": {
 			type: "boolean",
 			default: false,
@@ -163,6 +169,30 @@ const main = defineCommand({
 	async run({ args }) {
 		const pipelineT0 = Date.now();
 
+		// Title-only mode: no video, no encode. Exits before the input file is
+		// resolved so the caller does not have to pass one.
+		if (args["translate-title"]) {
+			const key =
+				args["api-key"] || process.env.GEMINI_API_KEY || "";
+			if (!key) {
+				consola.error("no API key: set GEMINI_API_KEY or pass --api-key");
+				process.exit(1);
+			}
+			const zh = await translateTitle(
+				args["translate-title"],
+				key,
+				args.model || DEFAULT_API_MODELS.gemini,
+				args.context,
+				args.glossary,
+			);
+			process.stdout.write(zh + "\n");
+			return;
+		}
+
+		if (!args.input) {
+			consola.error("missing input video (or use --translate-title)");
+			process.exit(1);
+		}
 		const input = resolve(args.input);
 		const noEnglish =
 			args["chinese-only"] || process.argv.includes("--no-english");

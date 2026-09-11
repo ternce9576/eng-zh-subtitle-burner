@@ -7,6 +7,7 @@
 #   ./run.sh --full           # skip the RSS gate, ask yt-dlp directly
 #   ./run.sh --no-download    # process what's already in incoming/
 #   ./run.sh --audit-only     # just check nothing has been missed
+#   ./run.sh --upload-only    # upload finished videos that were burned earlier
 #   ./run.sh --only "Part 2"  # process only matching filenames
 #
 # Env knobs:
@@ -52,6 +53,7 @@ GLOSSARY_DIR="${GLOSSARY_DIR:-glossary}"
 DONE_DIR="done"
 SUBS_DIR="sub"
 BURNER_DIR="eng-zh-subtitle-burner"
+WORKER_IMAGE="${WORKER_IMAGE:-eng-zh-subtitle-burner-worker:latest}"
 STATE_DIR=".state"
 CHANNEL_IDS="$STATE_DIR/channel_ids"
 LEDGER="$STATE_DIR/completed.list"
@@ -90,12 +92,14 @@ DELETE_SOURCE="${DELETE_SOURCE:-0}"
 DO_DOWNLOAD=1
 FORCE_FULL=0
 AUDIT_ONLY=0
+UPLOAD_ONLY=0
 ONLY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-download) DO_DOWNLOAD=0 ;;
     --full) FORCE_FULL=1 ;;
     --audit-only) AUDIT_ONLY=1; DO_DOWNLOAD=0 ;;
+    --upload-only) UPLOAD_ONLY=1; AUDIT_ONLY=1; DO_DOWNLOAD=0 ;;
     # Process only videos whose filename contains this substring. Handy for
     # testing one video end to end without touching the rest of the backlog.
     --only) shift; ONLY="${1:-}" ;;
@@ -181,6 +185,21 @@ video_is_intact() {
 
 ledger_has() { grep -qxF "$1" "$LEDGER" 2>/dev/null; }
 
+# Per-creator settings live in creators/<name>.conf as `key = value`, because
+# channels.txt had grown to five positional pipe-separated fields and uploading
+# needs several more. channels.txt still holds name and URL.
+CREATOR_DIR="${CREATOR_DIR:-creators}"
+
+creator_cfg() {
+  local creator="$1" key="$2" default="${3:-}" val=""
+  local f="$CREATOR_DIR/$creator.conf"
+  if [[ -f "$f" ]]; then
+    val=$(sed -e 's/#.*$//' "$f" | grep -m1 -E "^[[:space:]]*$key[[:space:]]*=" \
+          | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/\r$//')
+  fi
+  printf '%s' "${val:-$default}"
+}
+
 # A video that fails for a structural reason -- a corrupt download, an
 # unsupported stream -- fails identically every hour, forever. Count attempts
 # so it gets set aside and reported instead of quietly eating a GPU slot on
@@ -195,6 +214,265 @@ burn_attempts_for() {
 burn_exhausted() {
   local n; n=$(burn_attempts_for "$1")
   [[ -n "$n" ]] && (( n >= MAX_BURN_ATTEMPTS ))
+}
+
+# ---------------------------------------------------------------------------
+# Bilibili upload
+# ---------------------------------------------------------------------------
+# Off until the dry run looks right. With it off every upload is logged in full
+# but nothing is submitted and nothing is deleted.
+UPLOAD_ENABLED="${UPLOAD_ENABLED:-0}"
+UPLOADED="$STATE_DIR/uploaded.list"
+BILIUP="${BILIUP:-biliup}"
+
+uploaded_has() { grep -q "^$1	" "$UPLOADED" 2>/dev/null; }
+
+# Submissions already made for this creator today. The publish schedule alone
+# would space them out, but submitting a whole backlog in one afternoon still
+# means pushing tens of gigabytes at Bilibili in a burst, which is exactly the
+# shape of traffic that gets an account rate-limited.
+uploads_today() {
+  grep -c "^$1/[^	]*	$(date +%Y-%m-%d)" "$UPLOADED" 2>/dev/null || true
+}
+
+# Bilibili answers 21566 投稿过于频繁 when an account is submitting too fast --
+# typically a new account, or one whose logins come from an unexpected country.
+# The whole file has already been transferred by the time that answer arrives,
+# so retrying immediately costs another full upload and fails identically. Back
+# the creator off entirely instead.
+UPLOAD_BACKOFF_SEC="${UPLOAD_BACKOFF_SEC:-21600}"   # 6 hours
+
+upload_backoff_active() {
+  local f="$STATE_DIR/upload-backoff-$1" until_ts
+  [[ -f "$f" ]] || return 1
+  until_ts=$(cat "$f" 2>/dev/null || echo 0)
+  (( $(date +%s) < until_ts ))
+}
+
+set_upload_backoff() {
+  mkdir -p "$STATE_DIR"
+  echo $(( $(date +%s) + UPLOAD_BACKOFF_SEC )) > "$STATE_DIR/upload-backoff-$1"
+}
+
+upload_quota_left() {
+  local creator="$1" limit done_today
+  limit=$(creator_cfg "$creator" daily_limit 1)
+  done_today=$(uploads_today "$creator")
+  (( done_today < limit ))
+}
+
+# The YouTube id behind a downloaded file, recorded at download time. Bilibili
+# requires a 转载来源 URL whenever copyright=2.
+source_url_for() {
+  local creator="$1" base="$2" id
+  id=$(grep -m1 -F "	$base" "$STATE_DIR/videoids-$creator.tsv" 2>/dev/null | cut -f1)
+  [[ -n "$id" ]] && printf 'https://www.youtube.com/watch?v=%s' "$id"
+}
+
+# yt-dlp sanitises illegal filename characters, and not always identically
+# between the thumbnail and the video -- "I'm" became "Im" in one and not the
+# other. Fall back to matching on letters and digits alone, or the video posts
+# with no cover, which badly hurts its click-through.
+cover_for() {
+  local dir="$1" base="$2" want f
+  [[ -f "$dir/$base.jpg" ]] && { printf '%s' "$dir/$base.jpg"; return 0; }
+  want=$(printf '%s' "$base" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+  for f in "$dir"/*.jpg; do
+    [[ -e "$f" ]] || continue
+    if [[ "$(basename "$f" .jpg | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')" == "$want" ]]; then
+      printf '%s' "$f"; return 0
+    fi
+  done
+  return 1
+}
+
+# Bilibili's 延时发布 takes a unix timestamp and requires it to be at least 4
+# hours out. Videos are spaced one per day per creator at the creator's chosen
+# hour, so a cleared backlog trickles out instead of dumping twenty uploads in
+# an afternoon -- which reads as spam to viewers and to the algorithm.
+#
+# 18:00 China time is the default: of 250 currently-popular videos sampled from
+# the popular API, 18:00 was the single most common publish hour (42), ahead of
+# 17:00 (31) and the lunch bump at 11:00-12:00.
+next_publish_slot() {
+  local creator="$1" hour last now slot
+  hour=$(creator_cfg "$creator" publish_hour 18)
+  local f="$STATE_DIR/next-slot-$creator"
+  now=$(date +%s)
+
+  # Earliest legal slot: today at $hour China time, or tomorrow if that has
+  # passed or is inside the 4 hour minimum.
+  slot=$(TZ=Asia/Shanghai date -d "today ${hour}:00" +%s 2>/dev/null)
+  while (( slot < now + 4*3600 + 600 )); do
+    slot=$(( slot + 86400 ))
+  done
+
+  # Never schedule two videos into the same slot, including ones queued by an
+  # earlier run that have not published yet.
+  if [[ -f "$f" ]]; then
+    last=$(cat "$f" 2>/dev/null || echo 0)
+    while (( slot <= last )); do slot=$(( slot + 86400 )); done
+  fi
+  printf '%s' "$slot"
+}
+
+# Allocation and claim happen together under a lock, because uploads run inside
+# the parallel burn jobs and two of them could otherwise read the same slot and
+# both schedule for the same day. Claimed up front rather than after the upload
+# succeeds: a failed upload then leaves a one-day gap in the schedule, which
+# costs nothing, whereas a collision publishes two videos into one slot.
+reserve_publish_slot() {
+  local creator="$1" slot
+  mkdir -p "$STATE_DIR"
+  exec 7>>"$STATE_DIR/.slots.lock"; flock 7
+  # Remember what the slot was, so a failed upload can hand it back instead of
+  # pushing the whole schedule a day further out every time it fails.
+  cp -f "$STATE_DIR/next-slot-$creator" "$STATE_DIR/.prev-slot-$creator" 2>/dev/null \
+    || rm -f "$STATE_DIR/.prev-slot-$creator"
+  slot=$(next_publish_slot "$creator")
+  echo "$slot" > "$STATE_DIR/next-slot-$creator"
+  flock -u 7
+  printf '%s' "$slot"
+}
+
+release_publish_slot() {
+  local creator="$1"
+  exec 7>>"$STATE_DIR/.slots.lock"; flock 7
+  if [[ -f "$STATE_DIR/.prev-slot-$creator" ]]; then
+    mv -f "$STATE_DIR/.prev-slot-$creator" "$STATE_DIR/next-slot-$creator"
+  else
+    rm -f "$STATE_DIR/next-slot-$creator"
+  fi
+  flock -u 7
+}
+
+# Attribution, plus the original link. Kept in the creator's config so the
+# wording is yours, not mine.
+bili_desc_for() {
+  local creator="$1" base="$2" tpl source
+  tpl=$(creator_cfg "$creator" desc "")
+  [[ -n "$tpl" ]] || return 0
+  source=$(source_url_for "$creator" "$base")
+  tpl="${tpl//\{source\}/$source}"
+  tpl="${tpl//\{creator\}/$(creator_cfg "$creator" author "$creator")}"
+  tpl="${tpl//\{title\}/$base}"
+  # \n in the config becomes a real newline.
+  printf '%b' "$tpl"
+}
+
+# Translated once, here rather than during the burn, so a title is never spent
+# on a video that failed to encode.
+bili_title_for() {
+  local creator="$1" base="$2" ctx glossary_arg=()
+  ctx=$(creator_cfg "$creator" context "$DEFAULT_CONTEXT")
+  [[ -f "$GLOSSARY_DIR/$creator.txt" ]] && glossary_arg=(--glossary "$GLOSSARY_DIR/$creator.txt")
+  docker run --rm -e GEMINI_API_KEY -e ANTHROPIC_API_KEY -e OPENAI_API_KEY \
+    -v "$PWD:/data" -w /data "$WORKER_IMAGE" \
+    --translate-title "$base" --model "$MODEL" --context "$ctx" \
+    "${glossary_arg[@]}" 2>/dev/null | tail -1
+}
+
+# Returns 0 only when Bilibili has accepted the submission. Anything else
+# leaves every file untouched: believing a video is published when it is not is
+# the one failure this pipeline cannot recover from on its own.
+upload_one() {
+  local creator="$1" base="$2" mp4="$3" cover="$4"
+  local cookie tid tags copyright title source
+
+  uploaded_has "$creator/$base" && return 0
+  if upload_backoff_active "$creator"; then
+    echo "   $creator is backed off until $(date -d "@$(cat "$STATE_DIR/upload-backoff-$creator")" '+%H:%M') — skipping" >&2
+    return 1
+  fi
+  if ! upload_quota_left "$creator"; then
+    echo "   $creator already at its daily upload limit — $base waits for tomorrow" >&2
+    return 1
+  fi
+
+  cookie=$(creator_cfg "$creator" cookie "bilibili/$creator.json")
+  tid=$(creator_cfg "$creator" tid "")
+  tags=$(creator_cfg "$creator" tags "")
+  copyright=$(creator_cfg "$creator" copyright 2)
+  source=$(source_url_for "$creator" "$base")
+
+  # Refuse rather than guess. A wrong 分区 buries the video, a missing 转载来源
+  # gets it rejected at review, and no tags means no discovery.
+  local problem=""
+  [[ -z "$tid"  ]] && problem="no tid in $CREATOR_DIR/$creator.conf"
+  [[ -z "$tags" ]] && problem="no tags in $CREATOR_DIR/$creator.conf"
+  [[ "$copyright" == "2" && -z "$source" ]] && problem="copyright=2 needs a source URL, none recorded for this video"
+  [[ -f "$cookie" ]] || problem="no credentials at $cookie — run: biliup -u $cookie login"
+  if [[ -n "$problem" ]]; then
+    echo "!! upload skipped for $base: $problem" >&2
+    return 1
+  fi
+
+  title=$(bili_title_for "$creator" "$base")
+  [[ -n "$title" ]] || title="$base"
+
+  local desc; desc=$(bili_desc_for "$creator" "$base")
+  local args=(
+    -u "$cookie" upload
+    --title "$title"
+    --tid "$tid"
+    --tag "$tags"
+    --copyright "$copyright"
+  )
+  [[ -n "$desc" ]] && args+=(--desc "$desc")
+  # 转载来源 belongs to reposts only; sending it with 自制 is contradictory.
+  [[ "$copyright" == "2" && -n "$source" ]] && args+=(--source "$source")
+  [[ -n "$cover" && -f "$cover" ]] && args+=(--cover "$cover")
+  local dtime=""
+  if [[ "$(creator_cfg "$creator" schedule 1)" == "1" ]]; then
+    # A dry run only previews the slot; it must not reserve one.
+    if [[ "$UPLOAD_ENABLED" == "1" ]]; then
+      dtime=$(reserve_publish_slot "$creator")
+    else
+      dtime=$(next_publish_slot "$creator")
+    fi
+    args+=(--dtime "$dtime")
+    echo "   scheduled for $(TZ=Asia/Shanghai date -d "@$dtime" '+%Y-%m-%d %H:%M CST')" >&2
+  fi
+  [[ "$(creator_cfg "$creator" no_reprint 0)" == "1" ]] && args+=(--no-reprint 1)
+  args+=("$mp4")
+
+  if [[ "$UPLOAD_ENABLED" != "1" ]]; then
+    echo "   [dry run] would upload: $title" >&2
+    echo "   [dry run] $BILIUP ${args[*]}" >&2
+    return 1
+  fi
+
+  # biliup writes credentials to stdout on some paths, so its output goes to a
+  # file and only the lines we choose are echoed.
+  local ulog="$STATE_DIR/.upload-$creator-$$.log"
+  if ! "$BILIUP" "${args[@]}" >"$ulog" 2>&1; then
+    if grep -q "21566\|过于频繁" "$ulog"; then
+      set_upload_backoff "$creator"
+      [[ -n "$dtime" ]] && release_publish_slot "$creator"
+      echo "!! $creator is rate limited by Bilibili — backing off ${UPLOAD_BACKOFF_SEC}s, files left in place" >&2
+      notify "Bilibili rate limit" "$creator: submissions throttled, retrying later"
+      rm -f "$ulog"
+      return 1
+    fi
+    # Anything else might be a stale cookie, which a refresh does fix.
+    echo "   upload failed, refreshing credentials and retrying once" >&2
+    "$BILIUP" -u "$cookie" renew >/dev/null 2>&1
+    if ! "$BILIUP" "${args[@]}" >"$ulog" 2>&1; then
+      grep -q "21566\|过于频繁" "$ulog" && set_upload_backoff "$creator"
+      [[ -n "$dtime" ]] && release_publish_slot "$creator"
+      echo "!! upload failed for $base — files left in place" >&2
+      tail -3 "$ulog" | sed 's/^/     /' >&2
+      notify "Bilibili upload failed" "$creator: $base"
+      rm -f "$ulog"
+      return 1
+    fi
+  fi
+  rm -f "$ulog"
+
+  printf '%s\t%s\t%s\t%s\n' "$creator/$base" "$(date -Is)" \
+    "${dtime:+$(TZ=Asia/Shanghai date -d "@$dtime" '+%Y-%m-%d %H:%M CST')}" "$title" >> "$UPLOADED"
+  echo "   uploaded: $title" >&2
+  return 0
 }
 
 # Called from parallel burn jobs, so the read-modify-write needs serialising.
@@ -304,8 +582,18 @@ burn_one() {
     echo "$creator/$base" >> "$LEDGER"
     clear_burn_failures "$creator/$base"
     [[ -f "$NEW_DIR/$creator/$base.jpg" ]] && mv -f -- "$NEW_DIR/$creator/$base.jpg" "$out_dir/"
-    [[ "$DELETE_SOURCE" == "1" ]] && rm -f -- "$video"
     printf '%s\n' "$base" > "$JOB_DIR/ok.$tag"
+
+    # Disk is only reclaimed once Bilibili has actually accepted the video.
+    # Until then the source stays put: it is what makes a restyle or a reburn
+    # free, and deleting it early would mean re-downloading to fix anything.
+    if upload_one "$creator" "$base" "$out_dir/$base.mp4" "$(cover_for "$out_dir" "$base" || true)"; then
+      rm -f -- "$out_dir/$base.mp4" "$video"
+      cover=$(cover_for "$out_dir" "$base" || true); [[ -n "$cover" ]] && rm -f -- "$cover"
+      printf '%s\n' "$base" > "$JOB_DIR/up.$tag"
+    else
+      [[ "$DELETE_SOURCE" == "1" ]] && rm -f -- "$video"
+    fi
   else
     local attempts
     attempts=$(record_burn_failure "$creator/$base")
@@ -346,23 +634,25 @@ if [[ $AUDIT_ONLY -eq 0 ]]; then
     out_dir="$DONE_DIR/$creator"; mkdir -p "$out_dir" "$SUBS_DIR/$creator"
     out="$out_dir/$base.mp4"
 
-    context="$DEFAULT_CONTEXT"
+    # creators/<name>.conf first, then the old channels.txt positional fields,
+    # then the built-in default.
     chan_context=$(grep -m1 "^${creator}|" "$CHANNELS_FILE" 2>/dev/null | cut -d'|' -f3 | sed 's/\r$//')
-    [[ -n "$chan_context" ]] && context="$chan_context"
+    context=$(creator_cfg "$creator" context "${chan_context:-$DEFAULT_CONTEXT}")
 
     # 4th field of channels.txt: "zh" burns Chinese only (the creator already
     # burns their own English captions into the frame, so a second English
     # line would just stack on top of theirs). Anything else = both languages.
     # This can't be auto-detected: burned-in captions are pixels, not a
     # subtitle track, so ffprobe sees nothing.
-    sub_mode=$(grep -m1 "^${creator}|" "$CHANNELS_FILE" 2>/dev/null | cut -d'|' -f4 | sed 's/\r$//' | tr -d ' ')
-    [[ -z "$sub_mode" ]] && sub_mode="both"
+    chan_sub_mode=$(grep -m1 "^${creator}|" "$CHANNELS_FILE" 2>/dev/null | cut -d'|' -f4 | sed 's/\r$//' | tr -d ' ')
+    sub_mode=$(creator_cfg "$creator" sub_mode "${chan_sub_mode:-both}")
 
     # 5th field: how far off the bottom of the frame the Chinese line sits, in
     # ASS units (PlayResY is 288, so 288 = top of frame). Creators who burn
     # their own captions mid-frame need ours lifted clear of theirs; the
     # position of that band differs per creator, so it can't be a global.
-    zh_margin=$(grep -m1 "^${creator}|" "$CHANNELS_FILE" 2>/dev/null | cut -d'|' -f5 | sed 's/\r$//' | tr -d ' ')
+    chan_margin=$(grep -m1 "^${creator}|" "$CHANNELS_FILE" 2>/dev/null | cut -d'|' -f5 | sed 's/\r$//' | tr -d ' ')
+    zh_margin=$(creator_cfg "$creator" zh_margin "$chan_margin")
 
     log "Processing [$creator] $base"
     args=(
@@ -398,6 +688,7 @@ if [[ $AUDIT_ONLY -eq 0 ]]; then
   processed=$(ls "$JOB_DIR"/ok.* 2>/dev/null | wc -l)
   failed=$((failed + $(ls "$JOB_DIR"/fail.* 2>/dev/null | wc -l)))
   mapfile -t ready < <(cat "$JOB_DIR"/ok.* 2>/dev/null)
+  uploaded=$(ls "$JOB_DIR"/up.* 2>/dev/null | wc -l)
 fi
 
 # ---------------------------------------------------------------------------
@@ -406,6 +697,35 @@ fi
 # Doesn't trust RSS or the download loop: pulls the channel's full video list
 # and checks every id is either downloaded or explicitly skipped.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 2b. Upload videos burned by an earlier run
+# ---------------------------------------------------------------------------
+# Completion is recorded in the ledger, so a video burned before uploading
+# existed would otherwise never be offered to Bilibili at all.
+# Runs on every pass, not just --upload-only: a video burned before uploading
+# existed, or one that waited out a daily limit, would otherwise sit in done/
+# forever waiting to be asked for.
+if [[ $UPLOAD_ONLY -eq 1 || ( $AUDIT_ONLY -eq 0 && "$UPLOAD_ENABLED" == "1" ) ]]; then
+  log "Uploading finished videos"
+  touch "$UPLOADED"
+  up_ok=0; up_skip=0
+  while IFS= read -r -d '' mp4; do
+    creator="$(basename "$(dirname "$mp4")")"
+    base="$(basename "$mp4" .mp4)"
+    [[ -n "$ONLY" && "$base" != *"$ONLY"* ]] && continue
+    uploaded_has "$creator/$base" && continue
+    echo "  [$creator] $base"
+    cover=$(cover_for "$DONE_DIR/$creator" "$base" || true)
+    if upload_one "$creator" "$base" "$mp4" "$cover"; then
+      rm -f -- "$mp4" ${cover:+"$cover"} "$NEW_DIR/$creator/$base.mkv"
+      up_ok=$((up_ok+1))
+    else
+      up_skip=$((up_skip+1))
+    fi
+  done < <(find "$DONE_DIR" -type f -name '*.mp4' -print0 | sort -z)
+  log "$up_ok uploaded, $up_skip skipped"
+fi
+
 log "Auditing channels"
 : > "$MISSING_LOG"
 missing_total=0

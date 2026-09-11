@@ -215,6 +215,14 @@ fetch_next_video() {
       mkv=$(ls -t "$dir"/*.mkv 2>/dev/null | head -n 1 || true)
       if [[ -n "${mkv:-}" ]]; then
         local title_base; title_base="$(basename "$mkv" .mkv)"
+        # Remember which YouTube video this file came from. Bilibili requires
+        # a 转载来源 URL for reposted uploads, and the id is otherwise gone the
+        # moment the download finishes -- the filename is the title, not the id.
+        mkdir -p "$STATE_DIR"
+        local map="$STATE_DIR/videoids-$(basename "$dir").tsv"
+        touch "$map"
+        grep -qF "	$title_base" "$map" 2>/dev/null \
+          || printf '%s\t%s\n' "$video_id" "$title_base" >> "$map"
       fi
       return 0
     else
