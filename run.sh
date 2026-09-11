@@ -40,6 +40,18 @@ cd "$(dirname "$0")"
 # out of incoming/ and both would append it to the ledger. flock releases the
 # lock automatically if the run is killed, so a crash can't wedge the pipeline.
 mkdir -p .state
+
+# Keep the unattended log from growing without limit -- it is the only record
+# of what happened overnight, and an unbounded one eventually becomes too big
+# to open. Copy and truncate rather than rename: systemd holds the file open,
+# and a rename would leave it writing to a file nothing can find. Its append
+# mode means writes resume at offset zero after the truncate.
+PIPELINE_LOG="${PIPELINE_LOG:-.state/pipeline.log}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-10485760}"   # 10 MB
+if [[ -f "$PIPELINE_LOG" ]] && (( $(stat -c%s "$PIPELINE_LOG" 2>/dev/null || echo 0) > LOG_MAX_BYTES )); then
+  cp -f "$PIPELINE_LOG" "$PIPELINE_LOG.1" 2>/dev/null && : > "$PIPELINE_LOG"
+fi
+
 LOCK_FILE="${LOCK_FILE:-/var/lock/subtitle-pipeline.lock}"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
